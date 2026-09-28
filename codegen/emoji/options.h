@@ -18,6 +18,7 @@ struct Options {
 	QString replacesPath;
 	std::vector<QString> oldDataPaths;
 	QString writeImages;
+	QString flagsFontPath;
 };
 
 // Parsing failed if inputPath is empty in the result.

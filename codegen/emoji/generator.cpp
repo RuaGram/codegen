@@ -8,6 +8,7 @@
 
 #include <QtCore/QBuffer>
 #include <QtGui/QFontDatabase>
+#include <QtGui/QFontMetrics>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QPainter>
 #include <QtCore/QDir>
@@ -164,6 +165,7 @@ uint32 countCrc32(const void *data, std::size_t size) {
 
 Generator::Generator(const Options &options) : project_(Project)
 , writeImages_(options.writeImages)
+, flagsFontPath_(options.flagsFontPath)
 , data_(PrepareData(options.dataPath, OldDataPaths(options)))
 , replaces_(PrepareReplaces(options.replacesPath)) {
 	QDir dir(options.outputPath);
@@ -199,6 +201,9 @@ constexpr auto kEmojiInRow = 32;
 constexpr auto kEmojiRowsInFile = 16;
 constexpr auto kEmojiQuality = 99;
 constexpr auto kEmojiSize = 72;
+constexpr auto kFluentEmojiPadding = 4;
+constexpr auto kFluentEmojiFontSize = 180;
+constexpr auto kFluentPaintMargin = 32;
 constexpr auto kEmojiFontSize = 72;
 constexpr auto kEmojiShiftTop = 67 - 4;
 constexpr auto kScaleFromLarge = true;
@@ -214,6 +219,7 @@ constexpr auto kEmojiShiftLeftAndroid = -7;
 enum class ImageType {
 	Mac,
 	Android,
+	Fluent,
 	Twemoji,
 	JoyPixels,
 };
@@ -221,6 +227,8 @@ enum class ImageType {
 [[nodiscard]] ImageType GuessImageType(QString tag) {
 	if (tag.indexOf("NotoColorEmoji") >= 0 || tag.indexOf("Noto-COLR") >= 0) {
 		return ImageType::Android;
+	} else if (tag.indexOf("FluentEmoji") >= 0) {
+		return ImageType::Fluent;
 	} else if (tag.indexOf("twemoji") >= 0) {
 		return ImageType::Twemoji;
 	} else if (tag.indexOf("joypixels") >= 0) {
@@ -229,7 +237,86 @@ enum class ImageType {
 	return ImageType::Mac;
 }
 
-bool PaintSingleFromFont(QPainter &p, QRect targetRect, const Emoji &data, QFont &font, ImageType type, QImage &singleImage) {
+[[nodiscard]] QRect ComputeContentRect(const QImage &image) {
+	auto left = image.width();
+	auto top = image.height();
+	auto right = -1;
+	auto bottom = -1;
+	for (auto y = 0; y != image.height(); ++y) {
+		const auto pixels = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+		for (auto x = 0; x != image.width(); ++x) {
+			if (qAlpha(pixels[x])) {
+				left = std::min(left, x);
+				top = std::min(top, y);
+				right = std::max(right, x);
+				bottom = std::max(bottom, y);
+			}
+		}
+	}
+	return (right >= left)
+		? QRect(QPoint(left, top), QPoint(right, bottom))
+		: QRect();
+}
+
+[[nodiscard]] bool IsFlagSequence(const QString &id) {
+	const auto codepoints = id.toUcs4();
+	if (codepoints.size() == 2) {
+		return codepoints[0] >= 0x1F1E6
+			&& codepoints[0] <= 0x1F1FF
+			&& codepoints[1] >= 0x1F1E6
+			&& codepoints[1] <= 0x1F1FF;
+	} else if (codepoints.size() != 7
+		|| codepoints.front() != 0x1F3F4
+		|| codepoints.back() != 0xE007F) {
+		return false;
+	}
+	for (auto i = 1; i != 6; ++i) {
+		if (codepoints[i] < 0xE0061 || codepoints[i] > 0xE007A) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool PaintSingleFromFont(QPainter &p, QRect targetRect, const Emoji &data, const QFont &font, ImageType type, QImage &singleImage) {
+	if (type == ImageType::Fluent) {
+		const auto metrics = QFontMetrics(font);
+		singleImage = QImage(
+			metrics.horizontalAdvance(data.id) + 2 * kFluentPaintMargin,
+			metrics.height() + 2 * kFluentPaintMargin,
+			QImage::Format_ARGB32);
+		singleImage.fill(Qt::transparent);
+		{
+			QPainter q(&singleImage);
+			q.setPen(Qt::black);
+			q.setFont(font);
+			q.drawText(
+				kFluentPaintMargin,
+				kFluentPaintMargin + metrics.ascent(),
+				data.id);
+		}
+		const auto content = ComputeContentRect(singleImage);
+		if (content.isEmpty()
+			|| content.left() == 0
+			|| content.top() == 0
+			|| content.right() == singleImage.width() - 1
+			|| content.bottom() == singleImage.height() - 1) {
+			std::cout << "Bad emoji: " << data.id.toStdString() << std::endl;
+			return false;
+		}
+		const auto scaled = content.size().scaled(
+			targetRect.size() - QSize(
+				2 * kFluentEmojiPadding,
+				2 * kFluentEmojiPadding),
+			Qt::KeepAspectRatio);
+		const auto centered = QRect(
+			QPoint(
+				targetRect.x() + (targetRect.width() - scaled.width()) / 2,
+				targetRect.y() + (targetRect.height() - scaled.height()) / 2),
+			scaled);
+		p.drawImage(centered, singleImage, content);
+		return true;
+	}
 	singleImage.fill(Qt::transparent);
 	{
 		QPainter q(&singleImage);
@@ -404,27 +491,38 @@ QImage Generator::generateImage(int imageIndex) {
 
 	auto font = QGuiApplication::font();
 	auto base = writeImages_;
-	if (type == ImageType::Android) {
+	if (type == ImageType::Android || type == ImageType::Fluent) {
 		const auto regularId = QFontDatabase::addApplicationFont(base);
 		if (regularId < 0) {
-			std::cout << "NotoColorEmoji.ttf not loaded from: " << base.toStdString() << std::endl;
+			std::cout << "Emoji font not loaded from: " << base.toStdString() << std::endl;
 			return QImage();
+		}
+		if (type == ImageType::Fluent) {
+			const auto families = QFontDatabase::applicationFontFamilies(regularId);
+			if (families.isEmpty()) {
+				return QImage();
+			}
+			font.setFamily(families.front());
 		}
 	} else if (type == ImageType::Twemoji) {
 		base += "/assets/72x72";
 	} else if (type == ImageType::JoyPixels) {
 		base += "/png/unicode/512";
 	}
-	if (type == ImageType::Mac || type == ImageType::Android) {
+	if (type == ImageType::Mac || type == ImageType::Android || type == ImageType::Fluent) {
 		const auto family = (type == ImageType::Mac)
 			? QStringLiteral("Apple Color Emoji")
-			: QStringLiteral("Noto Color Emoji");
+			: (type == ImageType::Android)
+			? QStringLiteral("Noto Color Emoji")
+			: font.family();
 		font.setFamily(family);
 		font.setPixelSize(!kScaleFromLarge
 			? kEmojiFontSize
 			: (type == ImageType::Mac)
 			? kLargeEmojiFontSizeMac
-			: kLargeEmojiFontSizeAndroid);
+			: (type == ImageType::Android)
+			? kLargeEmojiFontSizeAndroid
+			: kFluentEmojiFontSize);
 		// A missing glyph must stay missing. Otherwise macOS paints Apple Color Emoji.
 		font.setStyleStrategy(QFont::NoFontMerging);
 		if (QFontInfo(font).family() != family) {
@@ -436,6 +534,24 @@ QImage Generator::generateImage(int imageIndex) {
 		}
 	} else {
 		return QImage();
+	}
+	auto flagsFont = QFont();
+	if (type == ImageType::Fluent && !flagsFontPath_.isEmpty()) {
+		const auto flagsId = QFontDatabase::addApplicationFont(flagsFontPath_);
+		if (flagsId < 0) {
+			std::cout << "Flags font not loaded from: " << flagsFontPath_.toStdString() << std::endl;
+			return QImage();
+		}
+		const auto families = QFontDatabase::applicationFontFamilies(flagsId);
+		if (families.isEmpty()) {
+			return QImage();
+		}
+		flagsFont.setFamily(families.front());
+		flagsFont.setPixelSize(kFluentEmojiFontSize);
+		flagsFont.setStyleStrategy(QFont::NoFontMerging);
+		if (QFontInfo(flagsFont).family() != families.front()) {
+			return QImage();
+		}
 	}
 
 	auto singleSize = 4 + sourceSize;
@@ -459,8 +575,13 @@ QImage Generator::generateImage(int imageIndex) {
 		for (auto i = 0; i != inFileCount; ++i) {
 			auto &emoji = data_.list[inFileShift + i];
 			const auto targetRect = QRect(column * kEmojiSize, row * kEmojiSize, kEmojiSize, kEmojiSize);
-			if (type == ImageType::Mac || type == ImageType::Android) {
-				if (!PaintSingleFromFont(p, targetRect, emoji, font, type, singleImage)) {
+			if (type == ImageType::Mac || type == ImageType::Android || type == ImageType::Fluent) {
+				const auto &chosenFont = (type == ImageType::Fluent
+					&& !flagsFontPath_.isEmpty()
+					&& IsFlagSequence(emoji.id))
+					? flagsFont
+					: font;
+				if (!PaintSingleFromFont(p, targetRect, emoji, chosenFont, type, singleImage)) {
 					++skippedCount;
 				}
 			} else if (type == ImageType::Twemoji || type == ImageType::JoyPixels) {

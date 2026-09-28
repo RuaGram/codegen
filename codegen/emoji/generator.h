@@ -59,6 +59,7 @@ private:
 	const common::ProjectInfo &project_;
 	int colorsCount_ = 0;
 	QString writeImages_;
+	QString flagsFontPath_;
 	QString outputPath_;
 	QString spritePath_;
 	std::unique_ptr<common::CppFile> source_;

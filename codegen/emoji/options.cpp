@@ -44,6 +44,13 @@ Options parseOptions() {
 			} else {
 				result.writeImages = args.at(i);
 			}
+		} else if (arg == "--flags-font") {
+			if (++i == count) {
+				logError(kErrorOutputPathExpected, "Command Line") << "font path expected after --flags-font";
+				return Options();
+			} else {
+				result.flagsFontPath = args.at(i);
+			}
 		} else if (result.dataPath.isEmpty()) {
 			result.dataPath = arg;
 		} else if (result.replacesPath.isEmpty()) {
